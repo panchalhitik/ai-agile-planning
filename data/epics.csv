@@ -1,0 +1,7 @@
+epic_id,epic_name,owner_team,priority
+EPIC-101,Checkout Redesign,Frontend,High
+EPIC-102,Search Relevance v2,Data,High
+EPIC-103,Payments Reliability,Backend,Critical
+EPIC-104,Mobile Performance,Frontend,Medium
+EPIC-105,Internal Admin Tools,Backend,Low
+EPIC-106,Observability Uplift,DevOps,Medium
