@@ -8,7 +8,9 @@ and makes everything easy to unit-test.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, timedelta
 
+import numpy as np
 import pandas as pd
 
 DONE = "Done"
@@ -219,6 +221,150 @@ def delivery_risk(issues: pd.DataFrame, epics: pd.DataFrame) -> pd.DataFrame:
         )
 
     return pd.DataFrame([r.__dict__ for r in rows])
+
+
+# ---------------------------------------------------------------------------
+# Current sprint / sprint health
+# ---------------------------------------------------------------------------
+def _dates(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series).dt.date
+
+
+def current_sprint_id(sprints: pd.DataFrame, today: date) -> str:
+    """The sprint containing `today`, else the most recently finished one."""
+    df = sprints.copy()
+    starts, ends = _dates(df["start_date"]), _dates(df["end_date"])
+    active = df[(starts <= today) & (today <= ends)]
+    if not active.empty:
+        return str(active.iloc[0]["sprint_id"])
+    past = df[ends < today]
+    if not past.empty:
+        return str(past.loc[ends[ends < today].idxmax(), "sprint_id"])
+    return str(df.iloc[0]["sprint_id"])
+
+
+def sprint_health(issues: pd.DataFrame, sprints: pd.DataFrame, today: date) -> dict:
+    """Snapshot of the sprint containing `today`: time vs work progress."""
+    sid = current_sprint_id(sprints, today)
+    sm = sprint_metrics(issues, sprints)
+    row = sm[sm["sprint_id"] == sid].iloc[0]
+    start = pd.to_datetime(row["start_date"]).date()
+    end = pd.to_datetime(row["end_date"]).date()
+    days_total = (end - start).days + 1
+    days_elapsed = min(max((today - start).days + 1, 0), days_total)
+    time_pct = round(days_elapsed / days_total * 100, 1)
+    completion_pct = float(row["completion_pct"])
+    return {
+        "sprint_id": sid,
+        "sprint_name": str(row["sprint_name"]),
+        "start_date": start,
+        "end_date": end,
+        "days_total": days_total,
+        "days_elapsed": days_elapsed,
+        "days_remaining": days_total - days_elapsed,
+        "time_pct": time_pct,
+        "committed_points": int(row["committed_points"]),
+        "completed_points": int(row["completed_points"]),
+        "blocked_points": int(row["blocked_points"]),
+        "completion_pct": completion_pct,
+        # Doing worse than the clock, with margin, means trouble.
+        "on_track": completion_pct >= time_pct - 20,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Monte Carlo completion forecast
+# ---------------------------------------------------------------------------
+MAX_FORECAST_SPRINTS = 40
+
+
+def remaining_backlog_points(issues: pd.DataFrame) -> float:
+    return float(issues.loc[issues["status"] != DONE, "story_points"].sum())
+
+
+def monte_carlo_forecast(
+    issues: pd.DataFrame,
+    sprints: pd.DataFrame,
+    today: date,
+    n_sims: int = 4000,
+    scope_delta_pct: float = 0.0,
+    capacity_delta_pct: float = 0.0,
+    seed: int = 7,
+) -> dict:
+    """Simulate delivery of the remaining backlog by resampling historical
+    sprint velocity. Returns percentile sprint counts and finish dates.
+
+    `scope_delta_pct` grows/shrinks the remaining backlog; `capacity_delta_pct`
+    scales every sampled velocity (a rough proxy for team-size changes).
+    """
+    sm = sprint_metrics(issues, sprints)
+    ends = _dates(sm["end_date"])
+    finished = sm[(ends < today) & (sm["completed_points"] > 0)]
+    samples = finished["completed_points"].to_numpy(dtype=float)
+    if samples.size == 0:
+        return {"ok": False, "reason": "No finished sprints to sample velocity from."}
+
+    remaining = remaining_backlog_points(issues) * (1 + scope_delta_pct / 100)
+    velocities = samples * (1 + capacity_delta_pct / 100)
+    if velocities.max() <= 0:
+        return {"ok": False, "reason": "Historical velocity is zero."}
+
+    rng = np.random.default_rng(seed)
+    sims = rng.choice(velocities, size=(n_sims, MAX_FORECAST_SPRINTS))
+    cumulative = sims.cumsum(axis=1)
+    needed = (cumulative < remaining).sum(axis=1) + 1
+    needed = np.minimum(needed, MAX_FORECAST_SPRINTS)
+    if remaining <= 0:
+        needed = np.zeros(n_sims, dtype=int)
+
+    # Sprint cadence for projecting calendar dates.
+    cadence = int(
+        pd.Series((pd.to_datetime(sm["end_date"]) - pd.to_datetime(sm["start_date"])).dt.days + 1).mode().iloc[0]
+    )
+    cur_end = pd.to_datetime(
+        sm.loc[sm["sprint_id"] == current_sprint_id(sprints, today), "end_date"].iloc[0]
+    ).date()
+
+    def _finish(n_sprints: int) -> date:
+        # The current sprint counts as the first of the n.
+        return cur_end + timedelta(days=cadence * max(n_sprints - 1, 0))
+
+    percentiles = {}
+    for p in (50, 70, 85, 95):
+        n = int(np.percentile(needed, p))
+        percentiles[f"p{p}"] = {"sprints": n, "finish_date": _finish(n)}
+
+    counts = np.bincount(needed, minlength=1)
+    return {
+        "ok": True,
+        "remaining_points": round(remaining, 1),
+        "velocity_samples": [float(v) for v in samples],
+        "velocity_mean": round(float(velocities.mean()), 1),
+        "n_sims": n_sims,
+        "percentiles": percentiles,
+        "distribution": {int(i): int(c) for i, c in enumerate(counts) if c > 0},
+        "horizon_capped": bool((needed >= MAX_FORECAST_SPRINTS).any() and remaining > 0),
+    }
+
+
+def what_if_forecast(
+    issues: pd.DataFrame,
+    sprints: pd.DataFrame,
+    today: date,
+    scope_delta_pct: float = 0.0,
+    capacity_delta_pct: float = 0.0,
+) -> dict:
+    """Baseline forecast next to a scenario with scope/capacity deltas."""
+    return {
+        "baseline": monte_carlo_forecast(issues, sprints, today),
+        "scenario": monte_carlo_forecast(
+            issues,
+            sprints,
+            today,
+            scope_delta_pct=scope_delta_pct,
+            capacity_delta_pct=capacity_delta_pct,
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------

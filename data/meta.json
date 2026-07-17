@@ -1,0 +1,31 @@
+{
+  "project_name": "Nova Commerce",
+  "project_codename": "Project Aurora",
+  "project_key": "NOVA",
+  "demo_today": "2026-07-15",
+  "current_sprint_id": "S09",
+  "blurb": "Nova Commerce is a synthetic e-commerce platform team: 8 people, 9 sprints, 6 epics \u2014 rebuilding checkout, hardening payments, and shipping a loyalty programme. The data is seeded with realistic trouble to find: an overloaded engineer, a blocker chain, and a critical epic running late.",
+  "anomalies": [
+    {
+      "id": "blocker_chain",
+      "title": "One migration is holding up four issues",
+      "detail": "NOVA-2107 'Migrate to payment gateway SDK v3' blocks 4 issues across Checkout and Payments.",
+      "page": "dependencies",
+      "issue_key": "NOVA-2107"
+    },
+    {
+      "id": "overload",
+      "title": "Priya is at ~140% capacity this sprint",
+      "detail": "Payments work has funnelled to one engineer in Sprint 9 \u2014 the utilisation chart shows the overload.",
+      "page": "sprint",
+      "member": "Priya Sharma"
+    },
+    {
+      "id": "critical_epic",
+      "title": "Checkout Redesign is in the Critical risk band",
+      "detail": "Only about a third of the scope is done after eight sprints and roughly a third is blocked \u2014 mostly behind the payments SDK migration.",
+      "page": "epics",
+      "epic_id": "EPIC-101"
+    }
+  ]
+}

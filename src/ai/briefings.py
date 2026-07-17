@@ -1,23 +1,21 @@
-"""AI-assisted summaries for sprint, backlog, and leadership audiences.
+"""Audience-specific briefings (sprint review / backlog / leadership).
 
-If an ANTHROPIC_API_KEY is configured (env var or Streamlit secrets), summaries
-are produced by Claude via the Anthropic SDK with a curated system prompt.
-Otherwise the module falls back to a deterministic, rules-based template so
-the dashboard always renders something useful - good for demos and CI.
+Claude writes the narrative from a structured payload computed by the
+analytics layer; a deterministic template produces the same sections when no
+key is configured. Streaming variant for st.write_stream.
 """
 
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
-from typing import Literal
+from typing import Iterator, Literal
 
 import pandas as pd
 
-Audience = Literal["sprint", "backlog", "leadership"]
+from src.ai.client import get_client, get_model
 
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+Audience = Literal["sprint", "backlog", "leadership"]
 
 SYSTEM_PROMPTS: dict[Audience, str] = {
     "sprint": (
@@ -40,6 +38,12 @@ SYSTEM_PROMPTS: dict[Audience, str] = {
     ),
 }
 
+AUDIENCE_LABELS: dict[Audience, str] = {
+    "sprint": "Sprint review",
+    "backlog": "Backlog refinement",
+    "leadership": "Leadership briefing",
+}
+
 
 @dataclass
 class SummaryResult:
@@ -48,19 +52,24 @@ class SummaryResult:
     model: str | None = None
 
 
-def _get_api_key() -> str | None:
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if key:
-        return key
-    try:
-        import streamlit as st
+def build_payload(
+    kpis: dict,
+    sprint_metrics_df: pd.DataFrame,
+    epic_risks_df: pd.DataFrame,
+    blocker_df: pd.DataFrame,
+) -> dict:
+    return {
+        "kpis": kpis,
+        "sprint_metrics": sprint_metrics_df.assign(
+            start_date=sprint_metrics_df["start_date"].astype(str),
+            end_date=sprint_metrics_df["end_date"].astype(str),
+        ).to_dict(orient="records"),
+        "epic_risks": epic_risks_df.to_dict(orient="records"),
+        "blockers": blocker_df.to_dict(orient="records"),
+    }
 
-        return st.secrets.get("ANTHROPIC_API_KEY") or None
-    except Exception:
-        return None
 
-
-def _build_user_prompt(audience: Audience, payload: dict) -> str:
+def _user_prompt(audience: Audience, payload: dict) -> str:
     return (
         f"Audience: {audience}\n"
         "Below is structured sprint / epic data as JSON. "
@@ -69,32 +78,10 @@ def _build_user_prompt(audience: Audience, payload: dict) -> str:
     )
 
 
-def _anthropic_summary(audience: Audience, payload: dict) -> SummaryResult | None:
-    key = _get_api_key()
-    if not key:
-        return None
-    try:
-        from anthropic import Anthropic
-
-        client = Anthropic(api_key=key)
-        resp = client.messages.create(
-            model=DEFAULT_MODEL,
-            max_tokens=900,
-            system=SYSTEM_PROMPTS[audience],
-            messages=[{"role": "user", "content": _build_user_prompt(audience, payload)}],
-        )
-        text = "".join(block.text for block in resp.content if block.type == "text")
-        return SummaryResult(text=text.strip(), source="anthropic", model=DEFAULT_MODEL)
-    except Exception as exc:  # pragma: no cover - network/credential errors
-        return SummaryResult(
-            text=f"_Anthropic call failed ({exc.__class__.__name__}); using fallback summary._\n\n"
-            + _fallback_summary(audience, payload),
-            source="fallback",
-        )
-
-
+# ---------------------------------------------------------------------------
+# Deterministic fallback
+# ---------------------------------------------------------------------------
 def _fallback_summary(audience: Audience, payload: dict) -> str:
-    """Deterministic, rules-based summary so the app always renders."""
     kpi = payload.get("kpis", {})
     sprint_rows = payload.get("sprint_metrics", [])
     risks = payload.get("epic_risks", [])
@@ -118,7 +105,10 @@ def _fallback_summary(audience: Audience, payload: dict) -> str:
                 f"- Top blocker: `{top.get('blocker')}` is blocking "
                 f"{top.get('blocks_count')} other issues."
             )
-        lines.append("- **Action:** trim next-sprint commit to the rolling velocity and unblock the top hotspot first.")
+        lines.append(
+            "- **Action:** trim next-sprint commit to the rolling velocity and "
+            "unblock the top hotspot first."
+        )
         return "\n".join(lines)
 
     if audience == "backlog":
@@ -131,8 +121,7 @@ def _fallback_summary(audience: Audience, payload: dict) -> str:
                 drivers = "; ".join(r.get("drivers", [])[:2])
                 lines.append(f"- `{r['epic_id']}` (risk {r['score']}, {r['band']}): {drivers}")
         if promote:
-            lines.append("")
-            lines.append("**Safe to promote / accelerate:**")
+            lines += ["", "**Safe to promote / accelerate:**"]
             for r in promote[:3]:
                 lines.append(f"- `{r['epic_id']}` (risk {r['score']})")
         lines += [
@@ -143,18 +132,15 @@ def _fallback_summary(audience: Audience, payload: dict) -> str:
         ]
         return "\n".join(lines)
 
-    # leadership
     total = kpi.get("total_points", 0)
     done = kpi.get("done_points", 0)
     blocked = kpi.get("blocked_points", 0)
     pct_done = (done / total * 100) if total else 0
     critical = [r for r in risks if r.get("band") in ("High", "Critical")][:3]
-
     paras = [
         f"**Portfolio status** - {pct_done:.0f}% of committed scope is delivered "
-        f"across {len(payload.get('sprint_metrics', []))} sprints "
-        f"({done} of {total} pts). Rolling velocity is "
-        f"{kpi.get('velocity_3', 0)} pts/sprint.",
+        f"across {len(sprint_rows)} sprints ({done} of {total} pts). Rolling "
+        f"velocity is {kpi.get('velocity_3', 0)} pts/sprint.",
         f"**Risk** - {blocked} pts are currently blocked. "
         + (
             "Top exposures: "
@@ -172,25 +158,48 @@ def _fallback_summary(audience: Audience, payload: dict) -> str:
     return "\n\n".join(paras)
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 def summarise(audience: Audience, payload: dict) -> SummaryResult:
-    result = _anthropic_summary(audience, payload)
-    if result is not None:
-        return result
-    return SummaryResult(text=_fallback_summary(audience, payload), source="fallback")
+    client = get_client()
+    if client is None:
+        return SummaryResult(_fallback_summary(audience, payload), "fallback")
+    model = get_model()
+    try:
+        resp = client.messages.create(
+            model=model,
+            max_tokens=900,
+            system=SYSTEM_PROMPTS[audience],
+            messages=[{"role": "user", "content": _user_prompt(audience, payload)}],
+        )
+        text = "".join(b.text for b in resp.content if b.type == "text")
+        return SummaryResult(text.strip(), "anthropic", model)
+    except Exception:  # noqa: BLE001 — network/credential errors
+        return SummaryResult(_fallback_summary(audience, payload), "fallback")
 
 
-def build_payload(
-    kpis: dict,
-    sprint_metrics_df: pd.DataFrame,
-    epic_risks_df: pd.DataFrame,
-    blocker_df: pd.DataFrame,
-) -> dict:
-    return {
-        "kpis": kpis,
-        "sprint_metrics": sprint_metrics_df.assign(
-            start_date=sprint_metrics_df["start_date"].astype(str),
-            end_date=sprint_metrics_df["end_date"].astype(str),
-        ).to_dict(orient="records"),
-        "epic_risks": epic_risks_df.to_dict(orient="records"),
-        "blockers": blocker_df.to_dict(orient="records"),
-    }
+def summarise_stream(audience: Audience, payload: dict) -> tuple[Iterator[str], str, str | None]:
+    """(chunk generator, source, model) — generator suits st.write_stream."""
+    client = get_client()
+    if client is None:
+        text = _fallback_summary(audience, payload)
+        return iter([text]), "fallback", None
+
+    model = get_model()
+
+    def _gen() -> Iterator[str]:
+        try:
+            with client.messages.stream(
+                model=model,
+                max_tokens=900,
+                system=SYSTEM_PROMPTS[audience],
+                messages=[{"role": "user", "content": _user_prompt(audience, payload)}],
+            ) as stream:
+                for chunk in stream.text_stream:
+                    yield chunk
+        except Exception:  # noqa: BLE001 — degrade mid-stream
+            yield "\n\n_Streaming failed — deterministic summary instead:_\n\n"
+            yield _fallback_summary(audience, payload)
+
+    return _gen(), "anthropic", model
